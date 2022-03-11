@@ -1,0 +1,1452 @@
+---
+title: 'Integrate Fusion Calls from TransAbyss, STAR, Karen Mungall, and CICERO'
+author: "Jenny Smith"
+date: "April 8, 2019"
+output: html_document
+---
+
+#Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME, '2020.04.13_CICERO_St.Jude'))
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(readr)
+getwd()
+```
+
+```{r}
+source(file.path(SCRIPTS,"conversion_scripts/Merge_Cat_FixDupIDs_Function.r"))
+```
+
+
+#Define Functions
+
+```{r}
+fusionCategory <- function(geneA,geneB){
+  fus <- c(geneA,geneB)
+  fus <- paste(fus[order(fus)], collapse = "-") #order alphabetically, so that the category includes  reciprocal fusions
+}
+```
+
+```{r}
+alias_converter <- function(fusion, gene_aliases=NULL, sep="-") {
+  #NOTE: ensure that all fusion references, and 
+  library(dplyr)
+  library(stringr)
+  
+  # Splits the fusion into 2 genes, then creates a regex to look them up with
+  fusion <- toupper(fusion) #ensure case is not an issue 
+  gene1 <- strsplit(fusion, split = sep)[[1]][1]
+  gene2 <- strsplit(fusion, split = sep)[[1]][2]
+  regex1 <- paste(paste0(" ",gene1," "),paste0("^",gene1," "),paste0(" ",gene1,"$"), sep="|") 
+  regex2 <- paste(paste0(" ",gene2," "),paste0("^",gene2," "),paste0(" ",gene2,"$"), sep="|")
+  
+  # Reads in a file containing a list of gene symbols and corresponding aliases for each symbol, unless provided by the gene_alias.df argument. 
+  if(is.null(gene_aliases)){
+    gene_aliases <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/Hs_GeneInfo.Symb.Alias.csv", header = TRUE, stringsAsFactors = FALSE) 
+  }
+  
+  # Identifies the aliases for each fusion gene from the alias spreadsheet above.
+  #ignore.case to double ensure, no matter which refrecne I use, capitolization is not an issue. 
+  gene1_aliases <- gene_aliases %>% 
+                      filter(grepl(regex1,alias, ignore.case = TRUE)) %>%
+                      select(alias) %>%
+                      unlist() %>%
+                      str_split(string = .,pattern = " ") %>%
+                      unlist() %>% 
+                      .[.!=""]
+  
+  gene2_aliases <- gene_aliases %>% 
+                      filter(grepl(regex2, alias, ignore.case = TRUE)) %>%
+                      select(alias) %>%
+                      unlist() %>%
+                      str_split(string = .,pattern = " ") %>%
+                      unlist() %>% 
+                      unlist() %>% 
+                      .[.!=""]
+  
+  #If any of the alias are a longer that 1 charater string, then discard the alias and use the given gene
+  #I cannot disambiguate the true alias without checking the chromosomal start and end genomic loci for each option. That will be too time consuming at this point. 
+  #Also, some genes are not in this gene alias reference, like AC004791.2. 
+  # if (length(gene1_aliases) > 1  | length(gene1_aliases) < 1 ){
+  #   gene1_aliases <- gene1
+  # }
+  # 
+  # if(length(gene2_aliases) > 1 | length(gene2_aliases) < 1){
+  #   gene2_aliases <- gene2
+  # }
+  
+  # Uses expand.grid() to create a dataframe with every combination possible of the aliases for fusion gene 1 and fusion gene 2
+  alias_combos <- expand.grid(x=gene1_aliases, y=gene2_aliases) %>%
+    unique(., na.rm = TRUE) 
+  
+  # Pastes all the combos back together into Gene1_Gene2 format
+  alias_fusions <- paste(alias_combos$x, alias_combos$y, sep = sep)
+ 
+  return(alias_fusions)
+  
+}
+```
+
+```{r}
+find_Fusions_aliases <- function(FOI, CICERO.Fusions, col="Fusion_Name",col2="Breakpoint1", alias.df=NULL){
+
+  #Pattern Matching for the fusion of interest
+  find_inDB <- function(fusion,CICERO.Fusions,col){
+      fus.A <-  fusion %in% CICERO.Fusions[[paste0(col,1)]]
+      fus.B <-  fusion %in% CICERO.Fusions[[paste0(col,2)]]
+      reciprocals <- c(fus.A, fus.B)
+      
+      return(reciprocals)
+  }
+  
+    res <- list()
+    aliases <- alias_converter(fusion = FOI, gene_aliases = alias.df )
+    res[[paste0(FOI,"_aliases")]] <- aliases
+    
+    reciprocals <- find_inDB(fusion = aliases, CICERO.Fusions=CICERO.Fusions, col=col)
+    if (any(reciprocals)){
+      alias <- aliases[which(reciprocals)]
+      idx <-  sapply(1:2, 
+                     function(x) which(CICERO.Fusions[, paste0(col,x)] == alias)) %>%
+         unlist()
+
+      res[[FOI]] <-  CICERO.Fusions[idx, col2] %>%
+                 unique(.) %>%
+                 paste("Alias",., collapse = "; ")
+    }
+
+
+  return(res)
+}
+```
+
+```{r}
+#function to compare breakpoints with +/- 5bp padding between callers
+comp_brkpts <- function(Sample,Caller_Column, Breakpoints_Column){
+  callers <- Caller_Column
+  breakpoints <- Breakpoints_Column 
+  # print(Sample)
+   
+  #remove any breakpoints that NA (were not detected by another caller)
+  idx <- which(!is.na(breakpoints))
+  callers <- callers[idx] %>% 
+    gsub("[Bb]reakpoints?\\.","",.)
+ 
+  #Check breakpoint for each caller 
+  num_callers <- length(idx)
+  if(num_callers == 1){
+    comp <- paste0("Only_Detected_by_",callers)
+    return(comp)
+  }
+  
+  #split and sort the breakpoints for easier comparisons
+  breakpoints <- breakpoints[idx] %>% 
+    str_split(., pattern = "\\|") %>% 
+    lapply(., sort) %>% 
+    set_names(callers)
+  
+  if (num_callers==2){
+    c1 <- identical(breakpoints[[1]], breakpoints[[2]])
+    comparisons <-set_names(c1, c(paste(callers[1],callers[2],sep="x")))
+  
+  }else if (num_callers ==3){
+    c1 <- identical(breakpoints[[1]], breakpoints[[2]])
+    c2 <- identical(breakpoints[[2]], breakpoints[[3]])
+    c3 <- identical(breakpoints[[1]], breakpoints[[3]])
+  
+    comparisons <- set_names(c(c1,c2,c3),c(paste(callers[1],callers[2],sep="x"), 
+                                          paste(callers[2],callers[3],sep="x"),
+                                          paste(callers[1],callers[3],sep="x")))
+  }
+  
+  if(all(comparisons)){
+    comp <- "all_identical_breakpoints"
+    return(comp)
+    
+  }else{
+    diff <- which(!comparisons)
+    results_of_bp_padding_comp <- c()
+    
+    #search through each comparison +/- 5bp 
+    for(i in 1:length(diff)){
+      callers_to_check <- str_split(names(diff)[i],pattern="x")[[1]]
+      # print(c(Sample,names(diff)[i]))
+      
+      #convert genomic position from string to numeric values 
+      #keep chromosome as string due to chr X and Y
+      numeric_brkpts <-  lapply(breakpoints[callers_to_check], function(x){
+            df <- str_split_fixed(x, pattern=":", n = 2) %>% 
+              as.data.frame() %>% 
+              rename_all(~c("chr","pos")) %>%
+              mutate(pos=as.numeric(pos),
+                     group=c("geneA","geneB"))
+            return(df)})
+      
+      #Add +/- 5bp to each genomic position
+      add_buffer <- lapply(numeric_brkpts, function(brkpoints_df){ 
+          genomic_positions <- brkpoints_df; 
+          chromosomes <- genomic_positions[,"chr"];
+          pos <- genomic_positions[,"pos"];
+          
+          for(n in c(-5:-1, 1:5)){ #avoid addition of 0 with seq(-5,5,by=1)
+            padding <- pos + n
+            genomic_positions <- add_row(genomic_positions,
+                                         chr=chromosomes,
+                                         pos=padding,
+                                         group=c("geneA","geneB"))
+          }
+        
+        #paste chr and pos to create exact breakpoint locations again
+        #seperate by chromosome for the two break points
+        genomic_positions <- genomic_positions %>% 
+          mutate(breakpoint=paste(chr, pos, sep=":")) %>% 
+          spread(group, breakpoint) %>% 
+          select(geneA, geneB)
+
+        return(genomic_positions)
+      })
+      
+      #Create matrices with every combination  of +/- 5bp around the breakpoint 
+      bool.pc1 <- !is.na(add_buffer[[callers_to_check[1]]][,"geneA"])
+      padded_combos_1 <- expand.grid(add_buffer[[callers_to_check[1]]] [[1]] [bool.pc1], 
+                                     add_buffer[[callers_to_check[1]]] [[2]] [!bool.pc1]) %>% 
+        mutate(breakpoints_tolerance=paste(Var1,Var2,sep="|"))
+      
+      bool.pc2 <- !is.na(add_buffer[[callers_to_check[2]]][,"geneA"])
+      padded_combos_2 <- expand.grid(add_buffer[[callers_to_check[2]]] [[1]] [bool.pc2], 
+                                     add_buffer[[callers_to_check[2]]] [[2]] [!bool.pc2]) %>% 
+        mutate(breakpoints_tolerance=paste(Var1,Var2,sep="|"))
+    
+      if(any(padded_combos_1$breakpoints_tolerance %in% padded_combos_2$breakpoints_tolerance |
+             padded_combos_2$breakpoints_tolerance %in% padded_combos_1$breakpoints_tolerance)){
+        comp <- "+/-5bp_matched_breakpoints"
+      }else if(!any(padded_combos_1$breakpoints_tolerance %in% padded_combos_2$breakpoints_tolerance |
+             padded_combos_2$breakpoints_tolerance %in% padded_combos_1$breakpoints_tolerance)){
+        comp <- "different_breakpoints"}
+      
+    #create a vector with the results of any searches for +/- 5bp breakpoint positions 
+    results_of_bp_padding_comp <- c(results_of_bp_padding_comp, comp)
+    }
+    
+  #Paste together the results of the comparisons  
+  comp <- case_when(
+    comparisons == TRUE ~  paste(names(comparisons)[comparisons], "identical", sep="_"),
+    comparisons == FALSE ~ paste(names(comparisons)[!comparisons],
+                                 results_of_bp_padding_comp, sep="_", collapse="\n")) %>%
+    unique() %>%
+    paste(., collapse="\n")
+  
+  return(comp)  
+  }
+}
+  
+```
+
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_5.29.20.csv"))
+
+merged <- merged %>% 
+  filter(USI != "Unknown")
+
+# head(merged[,1:5])
+# dim(merged) #2314  145
+```
+
+```{r}
+manifest <- read.csv("References/TARGET_AML_Ribodepleted_Master_Manifest_2.14.20.csv")
+
+# head(manifest[,1:5])
+# dim(manifest)
+```
+
+```{r}
+# dir(file.path(SWOG,"Clinical","CDE","Merged"))
+swog.CDE <- read.csv(file.path(SWOG,"Clinical","CDE","Merged","SWOG_AML_Merged_CDEs_2.20.20.csv"))
+
+head(swog.CDE)
+table(swog.CDE$Cytogenetic.abnormalities)
+table(swog.CDE$Cytogenetic.risk.group)
+```
+
+
+#Read in the Gene References
+
+```{r}
+gene_aliases <- read.csv(file.path(HOME,"0000.00.02_Reference_GeneInfo/Hs_GeneInfo.Symb.Alias.csv"),
+                         header = TRUE)
+gene_aliases$alias <- toupper(gene_aliases$alias)
+head(gene_aliases)
+```
+
+
+# Read in the Fusion Data 
+
+There were 3 batches of RNAseq A) ~1117 mostly 1031 and B) 457 from 0531,MNP, and flow sorted samples, and C) Relapses + paired diagnostics if not previously sequenceed, and CD34+ NBM
+
+Then the naming convention was changed between the two batches and thus BAM files were harmonized for naming. 
+However, Karens data and STAR all used the original naming system and must be updated with newest IDs, which is used by TransAbyss
+
+CICERO:
+Samples were mapped using STRONGARM. Fusions were called by CICERO (Tian et al.) Major fusion genes were manually selected by Tim and Xiaotu. An automated pipeline were used to annotate each sample. The final reported list was manually curated by Tim and Xiaotu. 
+
+
+```{r}
+Final_Fusion_Calls <- read.csv("Discordant_Samples/TARGET_AML_1031_type_XiaotuMa_FinalCalls.csv") %>% 
+  filter(final_xma=="yes") %>% 
+  group_by(Sample) %>% 
+  mutate(Fusion_xma=paste(Fusion,collapse = "; ")) %>%
+  ungroup() %>% 
+  select(Sample, final_xma, Fusion_xma) %>%
+  unique() %>%
+  arrange(Sample)
+
+head(Final_Fusion_Calls)
+# dim(Final_Fusion_Calls) #913   6
+# length(unique(Final_Fusion_Calls$Sample))
+# which(duplicated(Final_Fusion_Calls$Sample))
+```
+
+```{r}
+CICERO <- read.csv("CICERO_CDEs/AML_Fusion_Summary_ForSoheilsGroup__CICERO_output_v6.0_20200413.csv",
+                   check.names = TRUE,
+                   comment.char = "#",
+                   na.strings = c("^$","NA",""))  %>% 
+  filter(!is.na(Sample.s.)) %>%
+
+  mutate(Patient=gsub("_RBS|_srt","",COG.ID) %>% 
+           gsub("-","\\.",.),
+         USI=str_split_fixed(Patient,"\\.",n=5)[,3],
+         Time_point=ifelse(grepl("03A|09A", Patient), "dx","rlps"),
+         Breakpoint=paste(paste(ChrA,PosA, sep=":"),
+                          paste(ChrB,PosB, sep=":"),
+                          sep="|") %>% 
+                    gsub("chr","",.)) %>% 
+  mutate_at(vars(Patient), ~case_when(
+    grepl("_D2",Sample.s.) ~ paste0(.,"_replicate") ,
+    TRUE ~ . )) %>%
+  
+  left_join(., select(Final_Fusion_Calls,Sample, Fusion_xma, final_xma),
+            by=c("Patient"="Sample")) %>%
+
+  #Standardize fusion names
+  mutate_at(vars(Final.Fusion.Name), ~case_when(
+    grepl("RUNX1_STK3;KAT6A_NCOA2", .) ~ Fusion.Gene,
+    TRUE ~ . )) %>%
+  mutate_at(vars(Final.Fusion.Name, Fusion.Gene),~gsub("-","\\.",.)) %>%
+  mutate_at(vars(Final.Fusion.Name, Fusion.Gene),~gsub("_","-",.)) %>%
+  mutate_at(vars(Final.Fusion.Name, Fusion.Gene),~gsub(",$","",.)) %>%
+  mutate_at(vars(Final.Fusion.Name, Fusion.Gene),~gsub(",","-",.)) %>%
+
+  
+  #Clean  up  geneA,geneB columns that have multiple gene names included or were converted to dates into 8-Mar, 6-Sept date format by exce.l
+  rowwise() %>%
+  mutate_at(vars(geneA,geneB), ~case_when(
+    all(grepl("^[0-9]", .) & grepl("ATP", Fusion.Gene)) ~ str_split_fixed(Fusion.Gene, pattern="-",n = 3)[,3],
+    grepl("^[0-9]", .) ~ str_split_fixed(Fusion.Gene, pattern="-",n = 3)[,2],
+    grepl("SETP6", .) & grepl("SEPT6",Fusion.Gene) ~ "SEPT6",
+    grepl("MYH11", .) & grepl("NDE1",Fusion.Gene) ~ "NDE1",
+
+    grepl("MIR6716|MIR6775|MIR484",.) ~ gsub(",MIR6716|,MIR6775|,MIR484", "",.),
+    grepl("PALM2,PALM2.AKAP2,AKAP2", .) ~ gsub("PALM2,(PALM2.AKAP2),AKAP2", "\\1", .),
+    grepl("LUC7L2,C7orf55,C7orf55-LUC7L2", .) ~ gsub("LUC7L2,C7orf55,(C7orf55-LUC7L2)", "\\1", .),
+    grepl("TMX2,TMX2-CTNND1,CTNND1",.) ~ gsub("TMX2,TMX2-CTNND1,(CTNND1)", "\\1", .),
+    grepl("HOXA10,HOXA9,HOXA10-HOXA9", .) ~ gsub("HOXA10,HOXA9,(HOXA10-HOXA9)", "\\1", .),
+    grepl("TPT1,SNORA31", .) ~ gsub("(TPT1),SNORA31", "\\1", .),
+    TRUE ~ .)) %>%
+
+  mutate_at(vars(geneA,geneB), ~gsub("-","\\.",.)) %>%
+  mutate(Fusion.Category=fusionCategory(geneA,geneB)) %>%
+  ungroup() %>%
+
+  select(-matches("^X")) %>%
+  rename_at(vars(Sample.s.:Source,Breakpoint),~paste0(.,".CICERO")) %>%
+  
+  
+  #this entry is just messed up. the chromosomes dont match with the fusion genes reported or the fusion type reported (CTX).
+  filter(! grepl( "ABI1-ABI1",Fusion.Gene.CICERO)) %>%
+  
+  #re-order the columns 
+  select(1:2,USI,Patient,Time_point,
+         geneA.CICERO,geneB.CICERO,Fusion.Category,Fusion.Gene.CICERO,
+         Final.Fusion.Name.CICERO,Breakpoint.CICERO, functional.effect.CICERO,everything())
+
+
+# head(CICERO)
+dim(CICERO) # 1084  73
+length(unique(CICERO$Sample.s..CICERO)) #946 samples
+length(unique(CICERO$Patient)) #946
+# write.csv(CICERO,"CICERO_v6.0_Data_AddedCols_5.22.20.csv", row.names = FALSE)
+```
+
+```{r}
+#These samples had the fusion gene autocorrected to dates by excel.  
+errors_in_genes <- c("PAUUXA",
+"PAVKJD",
+"PAVKJD",
+"PAWICA",
+"PAWNPU",
+"PAWTSM",
+"PAXBEF",
+"PAXLDI")
+
+# CICERO %>%
+#   filter(USI %in% errors_in_genes) %>%
+#   view()
+```
+
+```{r}
+combined <- readr::read_csv(file.path(PROJHOME,"2018.09.11_Combine_Fusion_Calls/Combined_withConfidence_Intervals/1031_0531_Relapse_STAR_TA/TARGET_AML_0531_1031_Relapse_TransAbyss_STAR_withConfidenceLevels_Combined_Annotated_5.14.2020.csv")) %>% 
+  left_join(., select(manifest, Sample,Time_point), 
+            by=c("Patient"="Sample")) %>% 
+  filter(! (grepl("PAXGKH", Patient) & grepl("CBFA2T3-GLIS2", All_Fusions_Called)) ) %>%
+  select(USI:Type,Fusion.Category, everything())
+
+
+head(combined)
+# dim(combined) #112023     90
+length(unique(combined$Patient)) #2112
+table(combined$Group,useNA = 'ifany')
+```
+
+```{r}
+condensed.FOI <- read.csv(file.path(PROJHOME,"2018.09.11_Combine_Fusion_Calls/Combined_withConfidence_Intervals/1031_0531_Relapse_STAR_TA/TARGET_AML_0531_1031_Relapse_TransAbyss_STAR_Condensed_Fusion_Columns_5.14.20.csv")) %>% 
+  mutate(USI=str_split_fixed(Patient,"\\.",n=5)[,3]) %>%
+  select(Patient, USI, everything())
+
+dim(condensed.FOI)
+length(unique(condensed.FOI$Patient)) #1347
+head(condensed.FOI)
+# View(condensed.FOI)
+```
+
+```{r}
+# dir(file.path(SWOG,"RNA","mRNAseq","analysis","2020.01.24_STAR-Fusion"))
+swog <- read.csv(file.path(SWOG,"RNA","mRNAseq","analysis","2020.01.24_STAR-Fusion","SWOG_AML_STAR_Fusion_GRCh37.csv"))
+
+
+head(swog)
+dim(swog)
+```
+
+
+
+#Merge in the CDEs and CICERO
+
+what is CLoss, upTSS, NLoss, and other??? 
+
+CLoss is c-terminal loss (gene truncation)
+NLoss is n-terminal loss (gene truncation)
+
+```{r}
+table(CICERO$functional.effect.CICERO)
+
+CICERO %>% 
+  group_by(functional.effect.CICERO,Fusion.Category) %>% 
+  summarize(N=n()) %>% 
+  ungroup() %>% 
+  arrange(desc(functional.effect.CICERO), desc(N))
+```
+
+```{r eval=FALSE}
+CICERO %>% 
+  group_by(Type.CICERO) %>% 
+  summarize(N=n()) %>% 
+  write.csv("CICERO_Rearrangement_Types.csv", row.names = F)
+
+CICERO %>% 
+  group_by(functional.effect.CICERO) %>% 
+  summarize(N=n()) %>% 
+  write.csv("CICERO_Functional_Types.csv", row.names = F)
+
+```
+
+NOTE: there are 9 batch duplicates - denoted _D1 and _D2 in the ST. Jude Sample information 
+
+
+```{r}
+comparison <- merged %>% 
+  inner_join(., filter(CICERO,functional.effect.CICERO != "ITD", 
+                       Time_point=="dx"),
+                       by=c("USI")) %>% 
+  mutate(REGEX=paste(paste(geneA.CICERO,geneB.CICERO, sep="-"), 
+                paste(geneB.CICERO,geneA.CICERO, sep="-"), sep="|")) %>%
+  
+  #JADE2 is an alias to PHF15
+  mutate_at(vars(REGEX),
+            ~ifelse(grepl("JADE2", .), paste("NUP98-PHF15|PHF15-NUP98",.,sep="|"),.)) %>%
+
+  rowwise() %>%
+  mutate(Differences=case_when(
+    any(grepl(REGEX, Primary.Fusion.CNV) | grepl(REGEX, Additional.Fusions.CNV)) ~ "Concordant",
+    !any(grepl(REGEX, Primary.Fusion.CNV) | grepl(REGEX, Additional.Fusions.CNV)) &
+      Primary.Fusion.CNV == "None" ~ "CICERO_Only",
+
+    #Final.Fusion.Name.CICERO is ~ equivalent to Primary.Fusion.CNV. One patient may have two different fusions identified, but the final.fusion.name is the major fusion eg. CBFB or KMT2A
+    !any(grepl(REGEX, Primary.Fusion.CNV) | grepl(REGEX, Additional.Fusions.CNV)) &
+      grepl(Primary.Fusion.CNV,Final.Fusion.Name.CICERO) ~ "CICERO_Additional_Fusion",
+
+    !(grepl(REGEX, Primary.Fusion.CNV) | grepl(REGEX, Additional.Fusions.CNV)) ~ "CICERO_Different")) %>%
+  ungroup() %>%
+
+  select(USI,Patient, Sample.s..CICERO, Final.Fusion.Name.CICERO,
+         Fusion.Gene.CICERO, Primary.Fusion.CNV, Additional.Fusions.CNV,
+         -Fusion.Category,
+         geneA.CICERO, geneB.CICERO, ISCN,
+         -REGEX,
+         Differences,
+         functional.effect.CICERO,
+         Breakpoint.CICERO,
+         Age.in.years:Blast.percent..by.flow.,
+         FLT3.ITD.positive.) %>%
+
+  arrange(Differences,Primary.Fusion.CNV,Patient)
+
+
+
+head(comparison)
+length(unique(comparison$Patient)) #684
+length(unique(comparison$Sample.s..CICERO)) #684 with 9 batch duplicates
+# dim(comparison) #726  23
+# write.csv(comparison,"TARGET_AML_Primary.Fusion.CNV_vs_CICERO_5.20.20.csv", row.names = FALSE)
+```
+
+
+#FLT3-ITD and Indel Comparisons
+
+NOTE: there are 9 batch duplicates - denoted _D1 and _D2 in the ST. Jude Sample information 
+
+```{r}
+FLT3.Comparison <- merged %>% 
+  inner_join(.,filter(CICERO, Time_point=="dx"),
+            by="USI") %>% 
+  # filter(!is.na(Sample.s..CICERO)) %>% 
+
+  group_by(Patient,Sample.s..CICERO) %>%
+  mutate(CICERO_FLT3.ITD_Found=case_when(
+    any(Fusion.Category == "FLT3-FLT3") & FLT3.ITD.positive. == "Yes" ~ "CICERO_confirmed",
+    any(Fusion.Category == "FLT3-FLT3") & FLT3.ITD.positive. == "<0.1" ~ "CICERO_confirmed_<0.1AR",
+    any(Fusion.Category == "FLT3-FLT3") & FLT3.ITD.positive. == "No" ~ "CICERO_Found_NoMolEvidence",
+    
+    !any(Fusion.Category == "FLT3-FLT3") & FLT3.ITD.positive. == "No" ~ "CICERO_Confirmed_Negative",
+    !any(Fusion.Category == "FLT3-FLT3") & FLT3.ITD.positive. == "Yes" ~ "CICERO_Missed",
+    !any(Fusion.Category == "FLT3-FLT3") & FLT3.ITD.positive. == "<0.1" ~ "CICERO_Missed_<0.1AR"), 
+    N=n()) %>%
+  ungroup() %>% 
+  
+  group_by(Patient,Sample.s..CICERO) %>%
+  mutate(KEEP=case_when(
+    grepl("FLT3-FLT3", Fusion.Category) ~ TRUE,
+    !any(grepl("FLT3-FLT3", Fusion.Category)) ~  !duplicated(Patient),
+    TRUE ~ FALSE)) %>%
+  ungroup() %>% 
+  
+  filter(KEEP) %>% 
+  select(USI,Patient, Sample.s..CICERO,Fusion.Category,
+         FLT3.ITD.positive., 
+         CICERO_FLT3.ITD_Found,
+         # KEEP,N,
+         Final.Fusion.Name.CICERO, Fusion.Gene.CICERO, 
+         Primary.Fusion.CNV, Additional.Fusions.CNV,
+         geneA.CICERO, geneB.CICERO, ISCN,
+         functional.effect.CICERO, 
+         matches("CICERO")) %>%
+  arrange(FLT3.ITD.positive.,Patient) %>%
+  #Unique is because rows were duplicated due to merging on USI rather than Patient barcode. 
+  #patient samples with >1 fusion call were duplicated. 
+  unique() 
+
+
+dim(FLT3.Comparison) #783
+# head(FLT3.Comparison)
+length(unique(FLT3.Comparison$Sample.s..CICERO)) #783
+```
+
+
+
+#  RNA-seq Calls Comparison
+
+```{r}
+notes <- read.csv("fus_31_Soheil_XMA_Tim_notes.csv") %>% 
+  group_by(Patient) %>% 
+  mutate_at(vars(Final.Fusion.Name.CICERO,comment2,XM_Comments,Soheil_Comments,Tim_Comments), 
+            ~paste(.,collapse="; ")) %>% 
+  ungroup() %>%
+  select(Patient, Notes_Fusion_Name=Final.Fusion.Name.CICERO,comment2,XM_Comments,Soheil_Comments,Tim_Comments) %>% 
+  # had some wierd semi-colon that I couldnt remove bc it has some number of spaces or invisible characters... 
+  mutate_at(vars(Soheil_Comments), ~ifelse(Patient %in% "TARGET.20.PAWGTG.09A.01R", "", .)) %>%
+  mutate_at(vars(Soheil_Comments), ~gsub("^$", NA, .)) %>%
+  unique()
+
+# head(notes)
+# View(notes)
+```
+
+```{r}
+sm_edits <- read.csv("Discordant_Samples/TARGET_AML_Primary.Fusion.CNV_vs_CICERO_4.23.20_SMedits.csv") %>% 
+  filter(USI != "", Preferred != "", Preferred != "__") %>% 
+  select(Patient,Fusion.Gene.CICERO, Primary.Fusion.CNV, Preferred, Additional.Fusions.CNV) %>% 
+  group_by(Patient) %>% 
+  mutate_at(vars(Preferred), ~paste(., collapse="; ")) %>% 
+  ungroup() %>% 
+  mutate_at(vars(Preferred), ~gsub("^$", NA, .)) %>%
+  select(Patient, Preferred_SM=Preferred) %>% 
+  unique()
+
+
+# View(sm_edits)
+any(duplicated(sm_edits$Patient))
+```
+
+```{r}
+# intersect(unique(combined$Fusion.Category), unique(CICERO$Fusion.Category)) #135 fusions in common
+
+# setdiff(unique(CICERO$Fusion.Category),unique(combined$Fusion.Category)) #47 are unique - so these may need to be searched for aliases
+```
+
+```{r}
+RNAseq.Comparison <- CICERO %>% 
+  filter(functional.effect.CICERO != "ITD") %>%
+  mutate_at(vars(Fusion.Category),~case_when(
+    grepl("JADE2-NUP98", . ) ~ "NUP98-PHF15",
+    TRUE ~ .)) %>% 
+  left_join(., select(merged, USI, ISCN,Cyto.vs..Seq,
+                      Primary.Fusion.CNV, Additional.Fusions.CNV),
+            by="USI") %>%
+  left_join(., notes, by="Patient") %>%
+  left_join(., sm_edits, by="Patient") %>%
+  left_join(., select(combined,-USI, -Time_point,-ISCN),
+            by=c("Patient", "Fusion.Category")) %>%
+
+
+  #JADE2 is an alias to PHF15
+  mutate(REGEX=paste(paste(geneA.CICERO,geneB.CICERO, sep="-"),
+                paste(geneB.CICERO,geneA.CICERO, sep="-"), sep="|")) %>%
+  mutate_at(vars(REGEX),
+            ~case_when(
+              grepl("JADE2", .) ~  paste("NUP98-PHF15|PHF15-NUP98",.,sep="|"),
+              grepl("NDE1", .) ~ paste("CBFB-MYH11|MYH11-CBFB",.,sep="|"),
+              TRUE ~ .)) %>%
+
+  rowwise() %>%
+  mutate_at(vars(Num_FusionCaller_Hits),
+            ~case_when(
+              is.na(.) ~ 1,
+              grepl(REGEX, Fusion.Category) &
+                      (grepl(REGEX,Fusion.TA ) | grepl(REGEX,X.Fusion.STAR)) ~ .+1,
+              TRUE ~ .)) %>%
+  mutate_at(vars(Fusion_xma), ~gsub("NSD1_NUP98|NUP98_NSD1", "NUP98-NSD1", .)) %>%
+  ungroup() %>% 
+  mutate(Fusion_Only_In_CICERO=ifelse(Num_FusionCaller_Hits==1, "CICERO_Only", "Multiple_Callers")) %>%
+  
+  select(Patient, Time_point, matches("^USI"),
+         ISCN, Fusion_Only_In_CICERO,
+         final_xma, Fusion_xma,Final.Fusion.Name.CICERO,
+         Primary.Fusion.CNV,
+         Additional.Fusions.CNV,Cyto.vs..Seq,
+         Fusion.Category,
+
+         Fusion.Gene.CICERO,
+         Fusion.TA, X.Fusion.STAR, FusionName.TargAlign,
+
+         Notes_Fusion_Name,comment2,
+         Soheil_Comments,Preferred_SM,
+         XM_Comments, Tim_Comments,
+
+         ConfidenceLevel__byFusionsOfInterest, rating.CICERO,
+         Num_FusionCaller_Hits,
+
+         matches("Breakpoint"), matches("Reads"),
+         matches("Present_in"),
+         everything()) 
+
+
+dim(RNAseq.Comparison)
+```
+
+### Diagnostic Fusion Calls
+
+```{r}
+RNAseq.Comparison.dx <- RNAseq.Comparison %>% 
+  filter(Time_point=="dx") %>% 
+  
+  #Dont use CNVs in this iteration. Avoids confusion
+  # mutate_at(vars(Primary.Fusion.CNV), ~ifelse(grepl("mono|del", .), "", .)) %>%
+
+  rowwise() %>%
+  #rating.CICERO == "HQ" had to remove this filter bc NUP98-JADE2 was LQ fusion by CICERO...
+  mutate(
+    Updated_Primary.Fusion=case_when(
+      
+    final_xma == "yes" & Primary.Fusion.CNV == Fusion_xma ~ Primary.Fusion.CNV,
+    final_xma == "yes" & Primary.Fusion.CNV != Fusion_xma & !grepl(";", Fusion_xma) & 
+      grepl(Fusion_xma, Additional.Fusions.CNV) ~ Fusion_xma,
+    
+    final_xma == "yes" & Primary.Fusion.CNV != Fusion_xma  & #& Primary.Fusion.CNV != "monosomy7"
+      (grepl("Level[123]", ConfidenceLevel__byFusionsOfInterest)|  Num_FusionCaller_Hits > 1) & 
+      !grepl(";", Fusion_xma) ~ Fusion_xma,
+    
+    final_xma == "yes" & Primary.Fusion.CNV != Fusion_xma & # &Primary.Fusion.CNV != "monosomy7"
+       (grepl("Level[123]", ConfidenceLevel__byFusionsOfInterest)|  Num_FusionCaller_Hits > 1) ~ Final.Fusion.Name.CICERO,
+    
+    final_xma == "yes" & Primary.Fusion.CNV != Fusion_xma  & # &Primary.Fusion.CNV != "monosomy7"
+      !is.na(Soheil_Comments) ~ Soheil_Comments,
+
+  is.na(final_xma) & Primary.Fusion.CNV == Final.Fusion.Name.CICERO ~ Primary.Fusion.CNV,
+    is.na(final_xma) & Primary.Fusion.CNV != Final.Fusion.Name.CICERO & 
+      grepl("Karyotype c/w primary fusion", Soheil_Comments) ~ Primary.Fusion.CNV,
+    is.na(final_xma) & Primary.Fusion.CNV != Final.Fusion.Name.CICERO & 
+      grepl("Karyotype c/w cicero", Soheil_Comments) ~ Fusion.Category,
+    
+    	
+    is.na(final_xma) & Primary.Fusion.CNV != Final.Fusion.Name.CICERO & !is.na(Soheil_Comments) ~ Soheil_Comments,
+    is.na(final_xma) & Primary.Fusion.CNV != Final.Fusion.Name.CICERO & grepl("fusion negative", XM_Comments) ~ "None",
+    
+
+    Primary.Fusion.CNV == "None"  & any(grepl("Level[123]", ConfidenceLevel__byFusionsOfInterest) |  Num_FusionCaller_Hits > 1) ~
+      Fusion.Category,
+    Primary.Fusion.CNV != "None"   & any(grepl("Level[123]", ConfidenceLevel__byFusionsOfInterest) |  Num_FusionCaller_Hits > 1) ~
+      Fusion.Category,
+
+    TRUE ~ Primary.Fusion.CNV),
+
+  Updated_Additional.Fusions=case_when(
+    
+    grepl("cyto only", Cyto.vs..Seq) &  Updated_Primary.Fusion != Primary.Fusion.CNV ~ Primary.Fusion.CNV,
+    grepl("KMT2A-CCNJL", Primary.Fusion.CNV) ~ Fusion.Category,
+
+    Final.Fusion.Name.CICERO == "HNRNPUL1-MLLT10" & Primary.Fusion.CNV == "KMT2A-MLLT10" ~
+      paste(c(Additional.Fusions.CNV, Final.Fusion.Name.CICERO),  collapse = "; "),
+    
+    Primary.Fusion.CNV != Final.Fusion.Name.CICERO & Primary.Fusion.CNV == "KAT6A-CREBBP" &
+      Num_FusionCaller_Hits > 1 ~ ifelse(is.na(Additional.Fusions.CNV), Primary.Fusion.CNV,
+                                         paste(c(Primary.Fusion.CNV, Additional.Fusions.CNV),collapse = "; ")),
+
+    final_xma == "yes" & Primary.Fusion.CNV != Final.Fusion.Name.CICERO &
+      Num_FusionCaller_Hits > 1 & is.na(Additional.Fusions.CNV) ~ Fusion.Category,
+    final_xma == "yes" & Primary.Fusion.CNV != Final.Fusion.Name.CICERO &
+      Num_FusionCaller_Hits > 1 & !is.na(Additional.Fusions.CNV) ~ paste(c(Fusion.Category, 
+                                                                         Additional.Fusions.CNV), collapse="; "),
+
+
+    Primary.Fusion.CNV != Final.Fusion.Name.CICERO & Primary.Fusion.CNV != Fusion.Category &
+      Num_FusionCaller_Hits > 1 & is.na(Additional.Fusions.CNV) ~ Fusion.Category,
+    
+    Primary.Fusion.CNV != Final.Fusion.Name.CICERO & Primary.Fusion.CNV != Fusion.Category &
+      Num_FusionCaller_Hits > 1 & !is.na(Additional.Fusions.CNV) ~ paste(c(Fusion.Category,
+                                                                         Additional.Fusions.CNV), collapse="; "),
+     
+    is.na(final_xma) & Primary.Fusion.CNV != Final.Fusion.Name.CICERO & grepl("fusion negative", XM_Comments) &
+      Num_FusionCaller_Hits > 1 ~ Fusion.Category,
+
+    TRUE ~  Additional.Fusions.CNV)) %>%
+  
+  #Fix the order of fusions
+  mutate_at(vars(Updated_Primary.Fusion), ~case_when(
+    grepl("KDM5A-NUP98",.) ~ "NUP98-KDM5A",
+    grepl("NSD1-NUP98",.) ~ "NUP98-NSD1",
+    grepl("HOXB9-NIPBL", .) ~ "NIPBL-HOXB9",
+    grepl("-KMT2A$",.) ~ paste(str_split(., pattern = "-")[[1]][2],
+                               str_split(., pattern = "-")[[1]][1], sep="-"),
+    TRUE ~ . )) %>%
+  mutate(RECIPROCALS_CHECK=paste(paste(str_split_fixed(Updated_Primary.Fusion,pattern = "-",n=2)[1],
+                            str_split_fixed(Updated_Primary.Fusion,pattern = "-",n=2)[2], sep="-"),
+                            
+                            paste(str_split_fixed(Updated_Primary.Fusion,pattern = "-",n=2)[2],
+                                  str_split_fixed(Updated_Primary.Fusion,pattern = "-",n=2)[1], sep="-"),
+                            sep="|"),
+         RECIPROCALS_CHECK2=paste(paste(str_split_fixed(Updated_Additional.Fusions,pattern = "-",n=2)[1],
+                            str_split_fixed(Updated_Additional.Fusions,pattern = "-",n=2)[2], sep="-"),
+                            paste(str_split_fixed(Updated_Additional.Fusions,pattern = "-",n=2)[2],
+                                  str_split_fixed(Updated_Additional.Fusions,pattern = "-",n=2)[1], sep="-"),
+                            sep="|")) %>%
+  
+  mutate_at(vars(RECIPROCALS_CHECK), #RECIPROCALS_CHECK2
+            ~ifelse(grepl("None|del|mono", Updated_Primary.Fusion), "", .)) %>%
+  ungroup() %>%
+
+   # Clean up the primary/additional fusions columns for duplicate samples
+  mutate_at(vars(Updated_Additional.Fusions), ~ifelse(is.na(.), "", .)) %>%
+  group_by(Patient) %>%
+  mutate(Number_Samples=n()) %>%
+  mutate_at(vars(Updated_Primary.Fusion), ~case_when(
+    . == "" & grepl("ETV6-LMBR1|ETV6-MNX1|KMT2A-ABI1", Primary.Fusion.CNV) ~ Primary.Fusion.CNV,
+    . == "" & grepl("MED14-HOXA9", Final.Fusion.Name.CICERO) ~ Final.Fusion.Name.CICERO,
+    n() > 1 & .[1] != .[2] ~ .[1],
+    n() > 1 & length(unique(.)) > 1~ paste("0", .),
+    TRUE ~ . )) %>%
+
+  mutate_at(vars(Updated_Additional.Fusions), ~case_when(
+    !is.na(.) &  n() == 1  &
+      (Num_FusionCaller_Hits > 1 | grepl("CBFB-NDE1", "CBFB-MYH11", "CBFB-MYH9", Fusion.Category )) ~
+          paste(unique(.), collapse = "; ") %>% gsub(unique(RECIPROCALS_CHECK),"",.),
+    !is.na(.) &  n() >= 2 &
+      (Num_FusionCaller_Hits > 1 | grepl("CBFB-NDE1", "CBFB-MYH11", "CBFB-MYH9", Fusion.Category )) ~
+          unlist(str_split(., pattern = "; ")) %>% unique() %>%
+               gsub(unique(RECIPROCALS_CHECK),"",.) %>% paste0(., collapse = "; "),
+    TRUE ~ .)) %>%
+
+  ungroup() %>%
+
+
+  rowwise() %>%
+  mutate_at(vars(Updated_Additional.Fusions), ~case_when(
+    is.na(.) ~  "",
+    grepl("; NA;", .) ~ gsub("; NA;",";", .),
+    grepl("^NA;", .) ~ gsub("^NA;","", .),
+    grepl("^; ", .) ~ gsub("^; ","", .),
+    TRUE ~ .)) %>%
+  ungroup() %>%
+
+
+  mutate_at(vars(Additional.Fusions.CNV), ~ifelse(is.na(.),"",.)) %>%
+  rowwise() %>%
+  mutate(Differences_inPrimary=case_when(
+                          !grepl(RECIPROCALS_CHECK, Primary.Fusion.CNV) ~ "Changed",
+                          TRUE ~ "No Change"),
+         Differences_inAdditonal=case_when(
+                          Updated_Additional.Fusions != ""  &
+                            !grepl(RECIPROCALS_CHECK2, Additional.Fusions.CNV) ~ "Changed",
+                          Updated_Additional.Fusions != Additional.Fusions.CNV ~ "Changed",
+                          TRUE ~ "No Change")) %>%
+  ungroup() %>%
+
+  select(Patient,Sample.s..CICERO, Time_point,
+         Number_Samples,
+         matches("^USI"),
+         ISCN, Fusion_Only_In_CICERO,
+         
+         Primary.Fusion.CNV,Updated_Primary.Fusion,
+         Additional.Fusions.CNV,
+         Updated_Additional.Fusions,
+         Fusion.Category,
+
+         Differences_inPrimary,Differences_inAdditonal,
+         -final_xma, -Fusion_xma, -Final.Fusion.Name.CICERO,
+
+      
+
+         Fusion.Gene.CICERO,
+         Fusion.TA,
+         X.Fusion.STAR,
+         FusionName.TargAlign,
+
+         Cyto.vs..Seq,
+         -Notes_Fusion_Name,-comment2,
+         -Soheil_Comments,-Preferred_SM,
+         -XM_Comments, -Tim_Comments,
+
+         ConfidenceLevel__byFusionsOfInterest,
+         rating.CICERO,
+         Num_FusionCaller_Hits,
+
+         matches("Breakpoint"),
+         matches("Reads"),
+         matches("frame|exons|contig|probe"),
+         matches("_byFusionName$|Blacklist"),
+         FailedBlacklist_byBreakpoint,
+         FailedBlacklist_byFusionName,
+         -matches("^sv_|sum.break.reads.TA")) %>%
+
+  #Need this code block due to some individual patient samples with exact same fusion reported,
+  #but slightly different breakpoints. Will be used to compare breakpoints
+  group_by(Patient, Fusion.Category,Breakpoint.CICERO) %>%
+  mutate(ID=paste0(Patient, "_",Breakpoint.CICERO)) %>%
+  ungroup() %>%
+  
+  arrange(Primary.Fusion.CNV,Patient)
+
+
+
+length(RNAseq.Comparison.dx$Patient) #722 samples 
+dim(RNAseq.Comparison.dx) #722 65
+```
+
+```{r}
+brkpt_comp <- RNAseq.Comparison.dx %>% 
+  select(Patient, Fusion.Category, Fusion.TA, X.Fusion.STAR, matches("breakpoint")) %>% 
+  select(-breakpoint_pairs.TA,-FailedBlacklist_byBreakpoint,-X5.breakpoint.TA,-X3.breakpoint.TA,
+         -matches("t.Breakpoint.STAR|Local|TargAlign")) %>%
+  
+  #Need this code block due to some individual patient samples with exact same fusion reported, 
+  #but slightly different breakpoints
+  group_by(Patient, Fusion.Category,Breakpoint.CICERO) %>% 
+  mutate(ID=paste0(Patient, "_",Breakpoint.CICERO)) %>% 
+  ungroup() %>%
+  
+  #this is becuase there are samples with identical breakpoints, but for some reason the CICERO fusion caller is identifying three way fusions with TARGET.20.PAXBEF.09A.01R?? 
+  #I feel like *if* there is any actual evidence of this, why only report the exact same breakpoints for each? ATP5L-KMT2A-SEPT6 vs KMT2A-SEPT6.
+  unique() %>%
+  gather(Breakpoint_Caller, Breakpoint, Breakpoint.CICERO:Breakpoints.STAR) %>%
+  arrange(ID) %>%
+  
+  group_by(ID, Fusion.Category) %>%
+  mutate(breakpoint_comparison=comp_brkpts(Sample=Patient,
+                                           Caller_Column = Breakpoint_Caller,
+                                           Breakpoints_Column=Breakpoint)) %>%
+  ungroup() %>%
+  select(ID, Fusion.Category, breakpoint_comparison) %>%
+  unique()
+
+
+# head(brkpt_comp)
+dim(brkpt_comp) #720   3
+
+# table(brkpt_comp$breakpoint_comparison, useNA='ifany')
+```
+
+```{r}
+#Need to complete a breakpoint comparison and select better columns
+#Also, remove Mono7 and del5q and instead make is a fusion only columns
+RNAseq.Comparison.dx <- RNAseq.Comparison.dx %>% 
+  left_join(., brkpt_comp, by=c("ID", "Fusion.Category")) %>%
+  select(1:6, breakpoint_comparison, everything(), -ID)
+
+
+dim(RNAseq.Comparison.dx) #722  65
+```
+
+TARGET.20.PAWGTG.09A.01R Need consideration - has NCAM1-PGAP2 and MED14-HOXA10.HOXA9 both could be real but patient comments are to be fusion negative - so will default to that first. 
+
+```{r}
+nup.jade <- c("TARGET.20.PAWRUF.09A.01R",
+"TARGET.20.PAXFSI.09A.01R")
+# RNAseq.Comparison.dx$RECIPROCALS_CHECK
+# table(RNAseq.Comparison.dx$Updated_Primary.Fusion, useNA='ifany')
+
+
+#NOTE: still required major revisions manually bc this shit sucks. 
+# write.csv(RNAseq.Comparison.dx,"TARGET_AML_Diagnostic_RNAseq_Comparison_6.11.20.csv", row.names = FALSE)
+```
+
+
+###Relapse Samples
+
+```{r}
+RNAseq.Comparison.rlps <- RNAseq.Comparison %>% 
+  filter(Time_point=="rlps") %>% 
+
+  rowwise() %>%
+  mutate(
+   Relapse.Fusion=case_when(
+      
+      final_xma == "yes" & !grepl(";", final_xma) & 
+        any(grepl("Level[123]", ConfidenceLevel__byFusionsOfInterest) |  Num_FusionCaller_Hits > 1) ~ Fusion.Category,
+      
+      is.na(final_xma) & !is.na(Soheil_Comments) ~ Soheil_Comments,
+
+      any(grepl("Level[123]", ConfidenceLevel__byFusionsOfInterest) |  Num_FusionCaller_Hits > 1) ~
+        Fusion.Category, 
+      TRUE ~ "Lacks_Evidence")) %>%
+  
+  ungroup() %>% 
+
+
+  group_by(Patient) %>%
+  mutate(Relapse.Additional.Fusions=case_when(
+    Relapse.Fusion != Fusion.Category & Num_FusionCaller_Hits > 1 ~
+      paste(unique(Fusion.Category),collapse="; "),
+    TRUE ~ "")) %>%
+  ungroup() %>% 
+  
+  #Fix the order of fusions
+  rowwise() %>%
+  mutate_at(vars(Relapse.Fusion), ~case_when(
+    grepl("KDM5A-NUP98",.) ~ "NUP98-KDM5A",
+    grepl("NSD1-NUP98",.) ~ "NUP98-NSD1",
+    grepl("HOXB9-NIPBL", .) ~ "NIPBL-HOXB9",
+    grepl("-KMT2A$",.) ~ paste(str_split(., pattern = "-")[[1]][2],
+                               str_split(., pattern = "-")[[1]][1], sep="-"),
+    TRUE ~ . ))  %>%
+
+  # # Clean up the primary/additional fusions columns for duplicate samples
+  # mutate_at(vars(Relapse.Additional.Fusions), ~ifelse(is.na(.), "", .)) %>%
+  # group_by(Patient) %>%
+  # mutate(Number_Samples=n()) %>%
+  # mutate_at(vars(Updated_Primary.Fusion), ~case_when(
+  #   . == "" & grepl("ETV6-LMBR1|ETV6-MNX1|KMT2A-ABI1", Primary.Fusion.CNV) ~ Primary.Fusion.CNV,
+  #   . == "" & grepl("MED14-HOXA9", Final.Fusion.Name.CICERO) ~ Final.Fusion.Name.CICERO,
+  #   n() > 1 & .[1] != .[2] ~ .[1],
+  #   n() > 1 & length(unique(.)) > 1~ paste("0", .),
+  #   TRUE ~ . )) %>%
+  # 
+  # mutate_at(vars(Updated_Additional.Fusions), ~case_when(
+  #   !is.na(.) &  n() == 1  &
+  #     (Num_FusionCaller_Hits > 1 | grepl("CBFB-NDE1", "CBFB-MYH11", "CBFB-MYH9", Fusion.Category )) ~
+  #         paste(unique(.), collapse = "; ") %>% gsub(unique(RECIPROCALS_CHECK),"",.),
+  #   !is.na(.) &  n() >= 2 &
+  #     (Num_FusionCaller_Hits > 1 | grepl("CBFB-NDE1", "CBFB-MYH11", "CBFB-MYH9", Fusion.Category )) ~
+  #         unlist(str_split(., pattern = "; ")) %>% unique() %>%
+  #              gsub(unique(RECIPROCALS_CHECK),"",.) %>% paste0(., collapse = "; "),
+  #   TRUE ~ .)) %>%
+  # 
+  # ungroup() %>%
+
+
+  rowwise() %>%
+  mutate_at(vars(Updated_Additional.Fusions), ~case_when(
+    is.na(.) ~  "",
+    grepl("; NA;", .) ~ gsub("; NA;",";", .),
+    grepl("^NA;", .) ~ gsub("^NA;","", .),
+    grepl("^; ", .) ~ gsub("^; ","", .),
+    TRUE ~ .)) %>%
+  ungroup() %>%
+
+  select(Patient,Sample.s..CICERO,
+         Time_point, matches("^USI"),
+         Diagnostic_ISCN=ISCN, Fusion_Only_In_CICERO,
+         -final_xma, -Fusion_xma,-Final.Fusion.Name.CICERO,
+
+         Diagnostic_Primary.Fusion.CNV=Primary.Fusion.CNV,
+         Relapse.Fusion,
+
+         Diagnostic_Additional.Fusions.CNV=Additional.Fusions.CNV,
+         Relapse.Additional.Fusions,
+         Fusion.Category,
+
+         Fusion.Gene.CICERO,
+         Fusion.TA, X.Fusion.STAR, FusionName.TargAlign,
+
+         -Notes_Fusion_Name,-comment2,
+         -Soheil_Comments,-Preferred_SM,
+         -XM_Comments, -Tim_Comments,
+
+         ConfidenceLevel__byFusionsOfInterest, rating.CICERO,
+         Num_FusionCaller_Hits,
+
+         matches("Breakpoint"),
+         matches("Reads"),
+         matches("frame|exons|contig|probe"),
+         matches("_byFusionName$|Blacklist"),
+         FailedBlacklist_byBreakpoint,
+         FailedBlacklist_byFusionName,
+         -matches("^sv_|sum.break.reads.TA")) %>%
+  
+    #Need this code block due to some individual patient samples with exact same fusion reported, 
+  #but slightly different breakpoints
+  group_by(Patient, Fusion.Category,Breakpoint.CICERO) %>% 
+  mutate(ID=paste0(Patient, "_",Breakpoint.CICERO)) %>% 
+  ungroup() %>%
+
+  arrange(Diagnostic_Primary.Fusion.CNV, Patient)
+
+
+dim(RNAseq.Comparison.rlps) 
+```
+
+```{r}
+brkpt_comp_rlps <- RNAseq.Comparison.rlps %>% 
+  select(Patient, Fusion.Category, Fusion.TA, X.Fusion.STAR, matches("breakpoint")) %>% 
+  select(-breakpoint_pairs.TA,-FailedBlacklist_byBreakpoint,-X5.breakpoint.TA,-X3.breakpoint.TA,
+         -matches("t.Breakpoint.STAR|Local|TargAlign")) %>%
+  
+  #Need this code block due to some individual patient samples with exact same fusion reported, 
+  #but slightly different breakpoints
+  group_by(Patient, Fusion.Category,Breakpoint.CICERO) %>% 
+  mutate(ID=paste0(Patient, "_",Breakpoint.CICERO)) %>% 
+  ungroup() %>%
+  
+
+  unique() %>%
+  gather(Breakpoint_Caller, Breakpoint, Breakpoint.CICERO:Breakpoints.STAR) %>%
+  arrange(ID) %>%
+  
+  group_by(ID, Fusion.Category) %>%
+  mutate(breakpoint_comparison=comp_brkpts(Sample=Patient,
+                                           Caller_Column = Breakpoint_Caller,
+                                           Breakpoints_Column=Breakpoint)) %>%
+  ungroup() %>%
+  select(ID, Fusion.Category, breakpoint_comparison) %>%
+  unique()
+
+
+dim(brkpt_comp_rlps) #143 3
+table(brkpt_comp_rlps$breakpoint_comparison, useNA='ifany')
+```
+
+```{r}
+#Need to complete a breakpoint comparison and select better columns
+#Also, remove Mono7 and del5q and instead make is a fusion only columns
+RNAseq.Comparison.rlps <- RNAseq.Comparison.rlps %>% 
+  left_join(., brkpt_comp_rlps, by=c("ID", "Fusion.Category")) %>%
+  select(1:6, breakpoint_comparison, everything(), -ID)
+
+
+dim(RNAseq.Comparison.rlps) #143  62
+```
+
+```{r}
+# View(RNAseq.Comparison.rlps)
+table(RNAseq.Comparison.rlps$Relapse.Fusion, useNA='ifany')
+# table(RNAseq.Comparison.rlps$Relapse.Additional.Fusions, useNA='ifany')
+# write.csv(RNAseq.Comparison.rlps,"TARGET_AML_Relapse_RNAseq_Comparison_6.11.20.csv", row.names = FALSE)
+
+
+```
+
+
+### Missing Fusions
+
+There are  48 fusions across 57 patient samples (6.98%) that have no supporting evidence in STAR Fusion and TransAbyss. 
+
+1. Search for aliases across all entries in STAR/TA fusion calls.
+- ended up finding 0 hits this way.... odd. will double check but seems likely to have not been due to annotation. 
+
+2. Look at FOI for replacement of Fusion calls by CICERO.
+
+3. level3 fusion calls with the same or nearby breakpoints for each patient. 
+
+```{r}
+filter(RNAseq.Comparison, is.na(Fusion.TA), is.na(X.Fusion.STAR)) %>% 
+  filter(grepl("CBFB-MYH11", Fusion.Category)) %>% 
+  View()
+```
+
+```{r}
+filter(RNAseq.Comparison, is.na(Fusion.TA), is.na(X.Fusion.STAR)) %>% 
+  group_by(Fusion.Category) %>% 
+  summarise(N=n()) %>% 
+  ungroup() %>% 
+  arrange(desc(N))
+```
+
+```{r}
+missing_CICERO_calls <- filter(RNAseq.Comparison, 
+                               is.na(Fusion.TA), is.na(X.Fusion.STAR)) %>% 
+  select(Patient,Fusion.Category.CICERO=Fusion.Category,
+         matches(".CICERO|Comments|_xma|Primary.Fusion.CNV|Additional.Fusions.CNV")) %>% 
+  left_join(., combined, by="Patient") %>% 
+  filter(!Fusion.Category.CICERO %in%  c("CBFB-NDE1", "CBFB-MYH11", "CBFB-MYH9")) %>%
+  mutate(Fusion1=paste(GeneA,GeneB,sep="-"), 
+         Fusion2=paste(GeneB,GeneA,sep="-")) %>%
+  
+  
+  select(Patient, Time_point, matches("^USI"),
+         final_xma, Fusion_xma, Final.Fusion.Name.CICERO,
+         Primary.Fusion.CNV, Additional.Fusions.CNV,
+         Fusion.Category.CICERO,Fusion.Category, 
+
+         Fusion.Gene.CICERO, geneA.CICERO, geneB.CICERO,
+         Fusion1,Fusion2,
+         Fusion.TA, X.Fusion.STAR, FusionName.TargAlign,
+         
+         # Notes_Fusion_Name,comment2,
+         # Preferred_SM,Soheil_Comments,
+         # XM_Comments,Tim_Comments,
+         
+         matches("Breakpoint"), matches("Reads"),
+         everything())  %>% 
+  
+  arrange(Patient)
+
+
+head(missing_CICERO_calls, n=50)
+# dim(missing_CICERO_calls) #3287  195
+length(unique(missing_CICERO_calls$Patient)) #57
+```
+
+```{r}
+missing_CICERO_calls %>% 
+  filter(grepl("Level[1-3]",ConfidenceLevel__byFusionsOfInterest)) %>% 
+  select(Patient,USI,ISCN,ConfidenceLevel__byFusionsOfInterest,everything()) %>%
+  arrange(Patient,ConfidenceLevel__byFusionsOfInterest) %>%
+  write.csv(., "TARGET_AML_RNAseq_Comparison_Missed_Fusions_Detailed.csv", row.names = FALSE)
+
+```
+
+```{r}
+# filter(combined, grepl("TARGET.20.PAWNIK.09A.01R", Patient))
+filter(merged, grepl("PAWNIK", USI)) %>% 
+  select(USI,Primary.Fusion.CNV, Additional.Fusions.CNV, ISCN, Cyto.vs..Seq)
+```
+
+```{r}
+samples <- unique(missing_CICERO_calls$Patient) #57
+
+alias_results <- list()
+for(samp in samples){
+  CICERO.Fusions <- filter(missing_CICERO_calls, Patient==samp)
+  FOI <- unique(CICERO.Fusions$Fusion.Category.CICERO)
+  
+  if(length(FOI) > 1){
+    for(i in 1:length(FOI)){
+      res <- find_Fusions_aliases(FOI = FOI[i], CICERO.Fusions = CICERO.Fusions, col="Fusion", col2="breakpoint.TA")
+       alias_results[[paste(samp,i,sep="_")]] <- res
+    }
+    
+  }else{
+    res <- find_Fusions_aliases(FOI = FOI, CICERO.Fusions = CICERO.Fusions, col="Fusion", col2="breakpoint.TA")
+  }
+  
+  alias_results[[samp]] <- res
+  rm(FOI,CICERO.Fusions)
+}
+
+
+# alias_results
+```
+
+```{r}
+table( unique(missing_CICERO_calls$Patient) %in% unique(condensed.FOI$Patient))
+table( unique(missing_CICERO_calls$Patient) %in% unique(combined$Patient))
+```
+
+```{r}
+dups <- RNAseq.Comparison$Patient[which(duplicated(RNAseq.Comparison$Patient))]
+
+FOI.missed <- RNAseq.Comparison %>%
+  filter(!Fusion.Category %in%  c("CBFB-NDE1", "CBFB-MYH11", "CBFB-MYH9")) %>%
+  group_by(Patient) %>%
+  mutate(N=n()) %>%
+  filter((N == 1 & is.na(Fusion.TA) & is.na(X.Fusion.STAR)) | Patient %in% dups) %>% 
+  ungroup() %>% 
+  left_join(., select(condensed.FOI, -USI),
+            by="Patient") %>% 
+  select(Patient:USI,N, Fusion.Category,matches("^FOI"),Fusion.Gene.CICERO,
+         Updated_Primary.Fusion,Fusion.TA, X.Fusion.STAR, FusionName.TargAlign,
+         everything()) %>% 
+  arrange(Patient,Updated_Primary.Fusion,FOI)
+
+dim(FOI.missed) #83   
+# View(FOI.missed)
+# write.csv(FOI.missed,"TARGET_AML_RNAseq_Comparison_Missed_Fusions.csv", row.names = FALSE)
+```
+
+
+#MLLT10 Rearrangements
+
+```{r}
+MLLT10.pts <- read.csv("Fusions_Of_Interest/MLLT10_addl_fusion_Cicero_comparison.csv") %>% 
+  left_join(., select(RNAseq.Comparison,-USI),  by=c("Sample.s."="Sample.s..CICERO")) %>% 
+  select(Patient,USI,RR.Comments, Time_point:FusionName.TargAlign, everything())
+
+
+head(MLLT10.pts)
+# dim(MLLT10.pts) #101 267
+```
+
+```{r}
+# write.csv(MLLT10.pts, "Fusions_Of_Interest/MLLT10_addl_fusion_Cicero_comparison_withSTAR_TA_Fusions.csv",
+#           row.names = FALSE)
+```
+
+
+
+#Fusions in Mono7 and Del5q patients
+
+```{r}
+mono7_del5q <- merged %>% 
+  filter(monosomy.7 =="Yes" | del5q == "Yes" | 
+        grepl("monosomy7|del5q", Primary.Fusion.CNV)) %>%
+  filter(USI %in% combined$USI)  
+
+
+dim(mono7_del5q) #56
+table(mono7_del5q$Primary.Fusion.CNV)
+```
+
+```{r}
+mono7_del5q_fus <- combined %>% 
+  filter(USI %in% mono7_del5q$USI)  %>% 
+  select(-c(4:9)) %>%
+  inner_join(., select(mono7_del5q,USI,
+                       Primary.Fusion.CNV,
+                       monosomy.7,
+                       del5q,2:20),
+             by="USI") %>% 
+  select(Reg., USI,Patient, 
+         Primary.Fusion.CNV, monosomy.7,
+         del5q, colnames(mono7_del5q)[3:20],
+         everything())
+
+
+# dim(mono7_del5q_fus)#4857  108
+head(mono7_del5q_fus)
+table(mono7_del5q_fus$Type)
+```
+
+```{r}
+table(mono7_del5q_fus$ConfidenceLevel__byFusionsOfInterest)
+
+# write.csv(filter(mono7_del5q_fus, Type=="interchromosomal"), "TARGET_AML_Mono7_Del5q_Interchromosomal_Fusions.csv", 
+#           row.names = FALSE)
+
+
+# write.csv(filter(mono7_del5q_fus, Type=="intrachromosomal"), "TARGET_AML_Mono7_Del5q_Intrachromosomal_Fusions.csv",
+#           row.names = FALSE)
+```
+
+```{r}
+mono7_del5q_fus %>% 
+  filter(ConfidenceLevel__byFusionsOfInterest != "Level4") %>% 
+  group_by(Type,Fusion.Category) %>% 
+  summarise(Number_of_Patients=n()) %>% 
+  arrange(desc(Number_of_Patients)) %>%
+  filter(Number_of_Patients >= 2) %>% 
+  head()
+  # write.csv(.,"Mono7_Del5q_HigherConfidenceFusions_Frequencies.csv", row.names = FALSE)
+
+
+```
+
+
+#Check on NUP fusions
+
+High priority due to the NUP98 collab currently happening with Eline Bertrums
+
+```{r}
+clinical <- substr(CDE,1,nchar(CDE)-4)
+NUP98.Fusions <- read.csv(file.path(clinical,"analysis","2020.03.25_NUP98-Rearranged_AML_Collaboration", "TARGET_AML_NUP98.Rearranged_Fusions_Frequency.csv")) %>% 
+  separate(Var1, c("geneA","geneB"), sep="-", remove=F, fill="right") %>%
+  rowwise() %>%
+  mutate(Fusion.Category=fusionCategory(geneA, geneB)) %>% 
+  ungroup()
+
+# NUP98.Fusions
+```
+
+
+```{r}
+#these were identified using other sequencing assays and were determined to be false positives. 
+mismatched <- filter(merged, grepl("NUP98", Reason), !grepl("NUP98", Primary.Fusion.CNV)) %>% 
+  select(USI,Reason,Primary.Fusion.CNV, Additional.Fusions.CNV) %>% 
+  mutate(Has.RBD.Fusions=ifelse(USI %in% combined$USI,"Yes","No")) %>%
+  left_join(., condensed.FOI, by='USI') 
+
+# View(mismatched) 
+# table(mismatched$Has.RBD.Fusions)
+# dim(mismatched)
+```
+
+```{r}
+#KDM5A false positives by Tiffany H. PCR
+kdm5a.fp <- c("PANWHP", "PAPBEJ", "PASHBI")
+sum(kdm5a.fp %in% combined$USI)
+```
+
+```{r}
+#Discordant NUP98 Samples
+nup.discordant <- c("TARGET.20.PAWDWA.09A.01R",
+                    "TARGET.20.PAWGTG.09A.01R",
+                    "TARGET.20.PAXYGD.03A.01R")
+filter(condensed.FOI, Patient %in% nup.discordant)
+```
+
+```{r}
+nup_check <- comparison %>% 
+  filter( grepl("NUP98", Primary.Fusion.CNV) | grepl("NUP98", Additional.Fusions.CNV) | grepl("NUP98", Fusion.Gene.CICERO)) %>%  
+  left_join(., select(combined,-USI), by=c("Patient")) %>%
+
+  arrange(ConfidenceLevel__byFusionsOfInterest) %>%
+  filter(grepl("Level[1-2]",ConfidenceLevel__byFusionsOfInterest) |
+           grepl("NUP98|HOX", Fusion.Category)) %>%
+  mutate(False_Pos=ifelse(USI %in% kdm5a.fp, "FP","")) %>%
+  select(Patient, False_Pos, 
+         Fusion.Category,Fusion.TA,X.Fusion.STAR,
+         FusionName.TargAlign,
+         Final.Fusion.Name.CICERO,
+         Fusion.Gene.CICERO,
+         Primary.Fusion.CNV,
+         Additional.Fusions.CNV,
+         Differences,
+         matches("breakpoint")) %>%
+  unique()
+
+
+View(nup_check)
+# filter(nup_check, Patient %in% nup.discordant |
+#                       USI %in% kdm5a.fp)
+# write.csv(filter(nup_check, Patient %in% nup.discordant |
+#                       USI %in% kdm5a.fp),"TARGET_AML_CICERO_NUP98_Comparison.csv", row.names = FALSE)
+```
+
+The KDM5A false postives Do Not have RNA-seq evidence of the NUP98-KDM5A fusion. So these were called NUP98-KDM5A by a difference sequencing assay long ago in the lab. 
+
+PAXYGD was missed in the Primary.Fusion.CNV calls and will now be included. 
+
+```{r}
+table(nup_check$Fusion.Category %in% NUP98.Fusions$Fusion.Category)
+```
+
+
+```{r}
+#For Eline Bertrums Collab
+nup_breakpoints <- combined %>% 
+  filter(Time_point=="diagnostic") %>%
+  filter(Fusion.Category %in% NUP98.Fusions$Fusion.Category) %>%
+  filter(!grepl("Level4",ConfidenceLevel__byFusionsOfInterest)) %>%
+  select(Fusion.Category, breakpoint.TA,Breakpoints.STAR) %>%
+  gather(Algorithm,Breakpoints,
+         breakpoint.TA,Breakpoints.STAR)  %>%
+  filter(!is.na(Breakpoints)) %>%
+  unique() %>%
+  group_by(Fusion.Category) %>%
+  mutate(unique_breakpoints=unique(Breakpoints) %>%
+           paste(.,collapse="; ")) %>% 
+  ungroup() %>% 
+  select(Fusion.Category,unique_breakpoints) %>% 
+  unique() %>% 
+  
+  separate(unique_breakpoints,into = paste("breakpoint",1:12),
+           sep="; ",
+           fill="right", extra="warn", remove=F) %>%
+  mutate_at(vars(Fusion.Category), ~case_when(
+    !grepl("^NUP98", .) ~ paste0("NUP98-", gsub("-NUP98$", "", .)),
+    TRUE ~ .)) %>%
+  select(-unique_breakpoints)
+
+
+View(nup_breakpoints)
+# write.csv(nup_breakpoints, "TARGET_AML_NUP98-Rearranged_Breakpoints.csv", row.names = FALSE)
+```
+
+```{r}
+filter(merged, 
+       (grepl("NSD1",Primary.Fusion.CNV) | grepl("NSD1",Additional.Fusions.CNV)) & grepl("Yes",MLL))
+```
+
+```{r}
+MLL.Nups <- filter(merged, 
+       (grepl("NUP98",Primary.Fusion.CNV) | grepl("NUP98",Additional.Fusions.CNV)) & grepl("Yes",MLL)) %>% 
+  mutate(Has.RBD.Seq=ifelse(USI %in% manifest$USI,"Yes","No")) %>% 
+  select(USI,Primary.Fusion.CNV, Additional.Fusions.CNV, ISCN,Has.RBD.Seq, Cyto.vs..Seq)
+
+
+# table(MLL.Nups$Has.RBD.Seq)
+MLL.Nups
+# table(grepl("KMT2A-NUP98|NAPEPLD-NUP98|NUP98-X", combined$Fusion.Category))
+```
+
+
+#Check on CBFGLIS AMLs
+
+```{r}
+filter(CICERO, grepl("PAXGKH", Patient))
+filter(comparison, grepl("PAXGKH", USI)) #OK because its FLT3-ITD found only
+filter(combined, grepl("PAXGKH", USI))
+# filter(combined, grepl("PAXGKH", USI) & grepl("GLIS", All_Fusions_Called))
+```
+
+1 CBF-GLIS to Remove: PAXGKH, who was tested by Tiffany for RT-PCR and was not confirmed. She is retesting one more that had breakpoints not fully covered by the primers.
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

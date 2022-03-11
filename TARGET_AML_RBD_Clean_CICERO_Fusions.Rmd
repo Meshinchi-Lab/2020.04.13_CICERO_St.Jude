@@ -1,0 +1,568 @@
+---
+title: 'Clean CICERO Fusion Calls'
+author: "Jenny Smith"
+date: 'May 11, 2020'
+output: html_document
+---
+
+
+#Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'2020.04.13_CICERO_St.Jude'))
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(purrr)
+getwd()
+```
+
+
+
+#Define Functions
+
+```{r}
+##### Define Functions ################
+
+collapseRows <- function(col, uniq=FALSE){
+  #designed for dplyr so that col is the vector of the column name
+  if (uniq){col <- unique(col)}
+  
+  collapsed <- ifelse(all(is.na(col)), NA, paste(col, collapse = "; "))
+  return(collapsed)
+}
+
+
+
+filterFusions <- function(breakpoint,df2.Breakpoints){
+  
+  #just do breakpoints bc so many do not have a gene symbol annotated
+  fus <- breakpoint
+  fus2 <- df2.Breakpoints
+  
+  if (any(fus %in% fus2)){
+      res <- 1 #these fusions will be filtered out. 
+  }else{
+    res <- 0 #these one will not. 
+  }
+  
+  return(res)
+}
+
+
+removeDups <- function(col.rowwise){
+  
+  uniqued <- str_split(col.rowwise, "; ") %>% 
+  unlist() %>%
+  gsub(" ","",.) %>%
+  unique() %>%
+  paste(.,collapse = "; ")
+  
+  return(uniqued)
+  
+}
+
+```
+
+```{r}
+#Helper Functions for Tidy Cleaning
+fusionCategory <- function(geneA,geneB){
+  fus <- c(geneA,geneB)
+  fus <- paste(fus[order(fus)], collapse = "-") #order alphabetically, so that the category includes  reciprocal fusions
+}
+
+collapseFusions <- function(breakpoint){
+  paste(unique(breakpoint), collapse = "; ")
+}
+
+fillNA <- function(x,USI){
+  
+  USI <- unique(USI)
+  x <- x %>% .[!is.na(.)] %>% unique()
+  
+  if(length(x) < 1){
+    x <- ""
+  }
+  
+  # print(x)
+  return(x)
+}
+```
+
+
+
+
+#Read in the CDEs 
+
+```{r}
+manifest <- manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Master_Manifest_5.29.20.csv"))
+
+dim(manifest)
+```
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_5.29.20.csv"))
+
+merged <- merged %>% 
+  filter(!is.na(USI) | USI != "Unknown")
+
+dim(merged)
+
+```
+
+```{r}
+Normals <- read.csv("References/SJNORM_COG_ID_20200616.csv") %>% 
+  select_if(~!all(is.na(.))) %>% 
+  rename_all(~c("SJ.ID","Patient"))
+
+# head(Normals)
+# tail(Normals)
+dim(Normals)
+length(unique(Normals$SJ.ID))
+length(unique(Normals$Patient))
+```
+
+```{r}
+id.map <- openxlsx::read.xlsx("References/FredHutch_AML_RNAseq_MappingStatistics_v0.1_20200210.xlsx",rows=c(3:2000)) %>% 
+  select(Patient=TARGET, SJ.ID=SJID) %>%
+  filter(!is.na(SJ.ID)) %>%
+  unique() %>%
+  
+  #Add in NBMs
+  bind_rows(., Normals) %>%
+  mutate_at(vars(Patient),~gsub("_RBS|_srt","",.) %>%
+           gsub("-","\\.",.)) %>%
+  mutate_at(vars(Patient), ~case_when(
+    grepl("_D2",SJ.ID) ~ paste0(.,"_replicate") ,
+    TRUE ~ . )) %>%
+  select(Patient, SJ.ID) %>%
+  unique() %>%
+  
+  #quick check for AML/NBM counts
+  mutate(Group=ifelse(grepl("SJNORM",SJ.ID), "NBM","AML"))
+
+# head(id.map)
+
+dim(id.map) #1377
+table(id.map$Patient %in% manifest$Sample)
+# length(unique(id.map$Patient))
+# length(unique(id.map$SJ.ID))
+table(id.map$Group, useNA='ifany')
+
+# write.csv(id.map,"References/St.Jude_TARGET_CICERO_Sample_IDmap.csv", row.names = FALSE)
+```
+
+
+# Read in the Raw Fusions File
+
+
+```{r}
+cicero.raw <- read.delim("CICERO_raw/Raw_CICERO_Output_Result_20200324.txt",sep = "\t") %>% 
+  left_join(.,id.map, by=c("Sample.s."="SJ.ID")) %>%
+  select(Patient,Sample.s., everything(),-Group)
+
+head(cicero.raw)
+dim(cicero.raw) # 181,781     66
+```
+
+```{r}
+# table(cicero.raw$functional.effect)
+# ITDs <- write.csv(filter(cicero.raw, functional.effect=="ITD"), "CICERO_raw/Raw_CICERO_Output_ITDs_20200324.csv")
+```
+
+
+```{r}
+#CICERO has really, really, messy gene names for annotations that include NAs if intergenic, and comma seperated values in geneA,geneB columns 
+# head(cicero.raw, n=50) %>% View()
+any(is.na(cicero.raw$Sample.s.))
+length(unique(cicero.raw$Sample.s.)) #1373
+sum(is.na(cicero.raw$Sample.s.))
+
+sum(is.na(cicero.raw$Patient))
+length(unique(cicero.raw$Patient))
+```
+
+
+```{r}
+#Many repeats of the fusions/ITDs per Sample.s. sample
+# cicero.raw %>% 
+#   group_by(Sample.s., Fusion.Gene) %>% 
+#   summarise(N=n())
+```
+
+```{r}
+table(cicero.raw$Usage)
+table(cicero.raw$Type)
+
+table(is.na(cicero.raw$geneA))
+table(is.na(cicero.raw$geneB))
+# table(is.na(cicero.raw$Type))
+# table(cicero.raw$Type)
+table(is.na(cicero.raw$Fusion.Gene))
+table(cicero.raw$Fusion.Gene =="")
+```
+
+```{r}
+filter(cicero.raw,Type != "Internal_dup", Fusion.Gene =="") %>%
+  View() 
+```
+
+
+#Reformat and Clean Fusion Cols
+
+```{r}
+cicero.fmt <- cicero.raw %>% 
+  arrange(Sample.s.) %>%
+  filter(Type != "Internal_dup") %>% #ITDs will be treated seperately.
+  
+  #Standardize fusion names (as possible. some are just blank, or contain 3 gene symbols, or a underscore or a comma..)
+  mutate_at(vars(Fusion.Gene),~gsub("\\-","\\.",.)) %>%
+  mutate_at(vars(Fusion.Gene),~gsub(",$","",.)) %>%
+  mutate_at(vars(Fusion.Gene),~gsub("_","-",.)) %>%
+  mutate_at(vars(Fusion.Gene),~gsub(",","-",.)) %>%
+  
+  #separate out the gene aliases that are comma separated
+  separate(geneA,into = c("GeneA","geneA_alias1","geneA_alias2"), sep=",", 
+           fill="right", extra = "merge", remove = FALSE) %>%
+  separate(geneB,into = c("GeneB","geneB_alias1","geneB_alias2"), sep=",", 
+           fill="right", extra = "merge", remove = FALSE) %>% 
+  
+  #Fill in missing gene symbols with the feature (like intergenic)
+  mutate_at(vars(GeneA), ~ifelse(is.na(.), featureA, .)) %>%
+  mutate_at(vars(GeneB), ~ifelse(is.na(.), featureB, .)) %>%
+
+
+  #replace dashes with a dot, for example HOXA3-AS, should be HOXA3.AS
+  mutate_at(vars(matches("^gene[AB]")), ~gsub("\\-","\\.", .)) %>%
+
+  #Replace empty fusion names
+  mutate_at(vars(Fusion.Gene), ~case_when(
+    .=="" ~ paste(GeneA,GeneB, sep="-"),
+    TRUE ~ .)) %>%
+
+
+  #Create new standardized columns
+  mutate(USI=str_split_fixed(Patient,"\\.", n=5)[,3],
+         Fusion.Detected="Detected",
+         Breakpoint=paste(paste(ChrA,PosA, sep=":"),
+                          paste(ChrB,PosB, sep=":"), sep="|") %>% gsub("chr","",.),
+        Fusion_Type=ifelse(ChrA==ChrB,"intrachromosomal", "interchromosomal"), 
+        Chromosomes=paste(ChrA,ChrB, sep=",")) %>%
+
+  
+  rowwise() %>%
+  #Fusion category is to encompass both reciprocal fusions under 1 type/name.
+  mutate(Fusion.Category=fusionCategory(GeneA,GeneB)) %>%
+
+  #using sum of the breakpoint reads for gene A and gene B
+  #readsA/B:	number of junction reads that support the fusion
+  #total_readsA/B:	total reads number at the breakpoint at breakpoint A
+  mutate(sum.break.reads=sum(NumReadsA,NumReadsB)) %>%
+  ungroup() %>%
+
+  select(USI,Patient,Sample.s.,Fusion_Type,
+         GeneA,GeneB,
+         Fusion.Category,
+         Fusion.Gene,
+         Breakpoint,sum.break.reads,NumReadsA, NumReadsB,
+         functional.effect,everything()) 
+
+
+dim(cicero.fmt) #171,422     77
+```
+
+```{r fig.width=5, fig.height=5}
+# hist(log2(cicero.raw$NumReadsA+1))
+# hist(log2(cicero.raw$NumReadsB+1))
+length(unique(cicero.fmt$Sample.s.)) #1373 Sample.s.s
+length(unique(cicero.fmt$Patient)) #1373 Sample.s.s
+
+
+# write.csv(cicero.fmt, "CICERO_raw/TARGET_AML_0531_1031_Relapse_CICERO_fusions_reformatted_6.4.20.csv",
+#           row.names = FALSE)
+```
+
+
+#Filter out Fusions found in NBMs 
+
+```{r}
+#Using both NBM sets to account for the total fusions found in the NBM dataset
+NBM <- cicero.fmt %>% 
+  filter(grepl("NORM", Sample.s.))
+
+dim(NBM) #6148   78
+length(unique(NBM$Sample.s.)) #67
+
+# head(NBM)
+# write.csv(NBM,"CICERO_raw/TARGET_Fusions_in_NormalMarrrows_CICERO_6.4.20.csv",
+# row.names = FALSE)
+```
+
+```{r}
+NBM.Fusions <- table(NBM$Fusion.Category) %>%
+  as.data.frame() %>%
+  arrange(desc(Freq)) 
+
+head(NBM.Fusions)
+# View(NBM.Fusions)
+```
+
+
+```{r warning=FALSE}
+cicero.fmt.filter <- cicero.fmt %>%
+  
+  rowwise() %>%
+  mutate(FailedFilterFusions=filterFusions(Breakpoint,NBM$Breakpoint)) %>%
+  ungroup() %>%
+    
+  group_by(Sample.s.) %>%
+  mutate(AllFail=ifelse(sum(FailedFilterFusions) == n(),"Yes","No")) %>%
+  mutate(Fusion.Detected=ifelse((AllFail == "Yes" & Fusion.Detected != "NoneDetected"),
+                                           "NonePassedFilter", Fusion.Detected)) %>%
+  ungroup()  %>%
+  
+  filter(AllFail == "Yes" | FailedFilterFusions == 0) %>%
+  
+  #change all to characters so that numeric cols can be filled below with a charcter string.
+  mutate_all(funs(as.character(.))) %>%
+  
+  #Update any rows that did not pass NBM filter to state that.
+  rowwise() %>%
+  mutate_at(vars(Fusion_Type:Source),
+            ~ifelse(Fusion.Detected == "NonePassedFilter","NonePassedFilter",  .)) %>%
+  mutate_at(vars(sum.break.reads, 
+                 NumReadsA,NumReadsB,
+                 coverageA,coverageB,
+                 total_readsA,total_readsB,
+                 frame, medal, score),
+            ~ifelse(Fusion.Detected == "NonePassedFilter", NA,  as.numeric(.))) %>%
+  mutate(sum.coverage=sum(coverageA,coverageB, na.rm = T)) %>% 
+  ungroup() %>%
+  
+
+  select(Sample.s.,USI, Patient, everything(),
+         sum.coverage,Chromosomes,
+         -AllFail,-FailedFilterFusions,
+         -c(sv_refseqA:sv_interstitial_AA),
+         -sv_ort)%>%
+  unique(.) 
+  
+# head(cicero.fmt.filter)
+dim(cicero.fmt.filter) #102220     56
+length(unique(cicero.fmt.filter$Sample.s.))
+length(unique(cicero.fmt.filter$Patient))
+# colnames(cicero.fmt.filter)
+# sum(is.na(cicero.fmt.filter$sum.break.reads))
+# sum(is.na(cicero.fmt.filter$sum.coverage))
+```
+
+```{r}
+# write.csv(cicero.fmt.filter,
+#           "CICERO_raw/TARGET_AML_CICERO_Fusions_reformatted_FilteredForNBM_6.4.20.csv",
+#           row.names = FALSE)
+
+# dir(getwd())
+```
+
+
+#Define the Primary Fusions/Breakpoints per Sample.s. 
+
+```{r}
+getPrimaryFusion <- function(USI, frame, sum.break.reads, sum.coverage, 
+                             medal.scores, cicero.score){
+  # breakpoint, flanking_pairs,breakpoint_pairs,spanning_reads,frame are all columns from 
+  # brk.reads <- max(as.numeric(str_split_fixed(breakpoint_pairs,",", n=2)))
+  
+  if (all(is.na(sum.break.reads))){
+    res <- NA
+    return(res)
+  }
+  
+  resolveTies <- function(df){
+        df <- df %>%
+            group_by(primary) %>%
+            #if still a tie in breakpoint read counts, choose the first. 
+            mutate(rank=rank(brk.reads, ties.method = "first")) %>% 
+            mutate(rank=ifelse(primary=="alternate", 0, rank)) %>%
+            rowwise() %>%
+          
+            mutate(reason=sum(reason,rank)) %>%
+            ungroup() %>% 
+            mutate(primary=ifelse(reason == max(reason), "primary", "alternate"))
+        return(df)
+    }
+  
+  #Create boolean vectors for each type of evidence supporting the "primary" fusion. 
+  USI <- unique(USI)
+  
+  #in-frame is wieghted so that "in frame" is always the primary regardless of having fewer counts.
+  frames <- case_when(
+    grepl("1", frame) ~ 4, #1 is in-frame
+    grepl("2", frame) ~ 3, #fusion containes entire CDS for geneB
+    grepl("3", frame) ~ 2, #possible 5' UTR fusion in geneB
+    grepl("0", frame) ~ 0, #0 is not in frame
+    TRUE ~ 0) #there are > 95,000 entries without frame information in the dataset... so just set to zero I guess
+  brk.reads <-  sum.break.reads == max(sum.break.reads)
+  coverage <- sum.coverage == max(sum.coverage)
+  medal.score <- medal.scores == max(medal.scores)
+  fusion.score <- cicero.score == max(cicero.score)
+  
+  temp <- list("frames"=frames,
+               "brk.reads"=brk.reads, 
+               "coverage"=coverage, 
+               "medal.score"=medal.score,
+               "fusion.score"=fusion.score)
+  
+  #Create a temporary data frame. 
+  #column bind the true values to the boolean vectors. 
+  #the true values are avalaible this way for troubleshooting if necessary. 
+  temp <- bind_cols(temp) %>% 
+    bind_cols(.,data.frame(USI=USI, frame=frame, sum.break.reads=sum.break.reads,
+                       sum.coverage=sum.coverage, medal.scores=medal.scores,
+                       cicero.score=cicero.score))
+  
+  #Will prioritize the in-frame fusions (weighted), then select that one with the highest reads
+    temp <- temp %>%
+        rowwise() %>%
+        mutate(reason=sum(frames,brk.reads,coverage,medal.score,fusion.score)) %>%
+        ungroup() %>%
+        mutate(primary=ifelse(reason == max(reason), "primary", "alternate"))
+    
+    # break ties if there are multiple fusions with same #s of supporting reads.
+    # for those with highest evidence ("reason"), choose the one with the higher flanking reads
+    if (sum(temp$primary == "primary") > 1){
+        temp <- resolveTies(temp)
+        if (sum(temp$primary == "primary") >1 ){
+          # last check for ties, will break dplyr.
+          return(temp)
+        }
+    }
+
+  res <- temp$primary
+  
+  return(res)
+}
+```
+
+```{r warning=FALSE}
+cicero.fmt.primary <- cicero.fmt.filter %>% 
+  dplyr::select(everything(), frame) %>%
+  
+  #Group by sample ID, fusion name, and chromosomes.
+  #many fusions reported are intergenic-intergenic and must be distinguished by chromosomes due to a lack of gene symbols
+  #Also, quickly spot checking, many of these intergenic coordinates do have gene symbols (eg LINCs), but the reference must be out of date. shocking. cicero has just been the best.
+  group_by(Sample.s.,Fusion.Category,Chromosomes) %>%
+  mutate(Primary.Fusion=getPrimaryFusion(USI=Sample.s.,
+                                         frame=frame,
+                                         sum.break.reads=sum.break.reads,
+                                         sum.coverage=sum.coverage,
+                                         medal.scores=medal,
+                                         cicero.score=score)) %>%
+  arrange(Sample.s.,Fusion.Category, Chromosomes) %>%
+  ungroup() %>%
+  
+  group_by(Sample.s.,Fusion.Category,Chromosomes, Primary.Fusion) %>%
+  mutate(Alternate.Breakpoints=ifelse(Primary.Fusion=="alternate",
+                                      collapseFusions(breakpoint = Breakpoint), NA)) %>%
+  ungroup() %>%
+
+  group_by(Sample.s.,Fusion.Category, Chromosomes) %>%
+  mutate(Alternate.Breakpoints=fillNA(Alternate.Breakpoints, USI=Sample.s.)) %>%
+  mutate(Alternate.Breakpoints=ifelse(Breakpoint==Alternate.Breakpoints,"",Alternate.Breakpoints)) %>%
+  ungroup() %>%
+
+  filter(grepl("primary", Primary.Fusion) | grepl("NonePassedFilter|NoneDetected", Fusion.Category)) %>%
+  select(Sample.s.,Patient,USI,
+         Fusion_Type,
+         Fusion.Category,Fusion.Gene,
+         Breakpoint,Alternate.Breakpoints,
+         matches("Breakpoint|reads"),
+         everything(),
+         -Primary.Fusion, -sum.break.reads, -sum.coverage)
+
+
+
+
+dim(cicero.fmt.primary) #74,371    55
+length(unique(cicero.fmt.primary$Sample.s.)) #1373
+length(unique(cicero.fmt.primary$Patient)) #1373
+# View(cicero.fmt.primary)
+```
+
+```{r}
+head(cicero.fmt.primary)
+# table(grepl("NonePassedFilter|NoneDetected", cicero.fmt.primary$Fusion.Category))
+```
+
+
+    
+#Add Age and Clinical Information     
+    
+```{r}
+cicero.fmt.primary <- cicero.fmt.primary %>% 
+  left_join(.,select(merged,USI, Protocol, Age.in.years, ISCN), 
+            by="USI") %>% 
+  select(Sample.s.:USI,Protocol:ISCN,everything())
+
+
+head(cicero.fmt.primary)
+dim(cicero.fmt.primary)  #74,371
+```
+
+```{r}
+# write.csv(cicero.fmt.primary, "CICERO_raw/TARGET_AML_0531_1031_Relapse_CICERO_reformatted_FilteredForNBM_PrimaryFusions_6.12.20.csv", row.names = FALSE)
+```
+
+```{r}
+tab <- cicero.fmt.primary %>% 
+  group_by(Fusion.Category, Chromosomes) %>% 
+  summarize(N=n()) %>%
+  arrange(desc(N))
+
+filter(tab, Fusion.Category != "intergenic-intergenic") %>% head(n=15)
+# filter(tab,  Fusion.Category == "CBFB-MYH11") #108 pts
+```
+
+
+#Split into Intra/Inter Chromosomal Fusions 
+
+```{r}
+inter <- cicero.fmt.primary %>% 
+  filter(grepl("interchromosomal|NoneDetected|NonePassedFilter", Fusion_Type)) %>%
+  select(-Fusion.Category)
+
+head(inter)
+dim(inter) #33,773    57
+
+
+# write.csv(inter,"CICERO_raw/TARGET_AML_0531_1031_Relapse_CICERO_reformatted_InterChromosomal_FilteredForNBM_6.12.20.csv",row.names = FALSE)
+```
+
+```{r}
+intra <- cicero.fmt.primary %>% 
+  filter(grepl("intrachromosomal|NoneDetected|NonePassedFilter", Fusion_Type)) %>%
+  select(-Fusion.Category)
+
+head(intra)
+dim(intra)  #40,666    57
+
+
+# write.csv(intra, "CICERO_raw/TARGET_AML_0531_1031_Relapse_CICERO_reformatted_IntraChromosomal_FilteredForNBM_6.12.20.csv", row.names = FALSE)
+```
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
